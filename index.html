@@ -10,8 +10,8 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <!-- Google Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700;800&display=swap" rel="stylesheet">
-    <!-- PeerJS for Realtime Peer-to-Peer Multiplayer -->
-    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <!-- MQTT.js for Super Reliable Realtime Multiplayer -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
     
     <style>
         body {
@@ -174,14 +174,21 @@
         <!-- ONLINE ROOM WAITING LOBBY -->
         <div id="room-lobby-screen" class="hidden w-full max-w-lg mx-auto my-auto bg-slate-900 border-2 border-amber-500 p-6 rounded-2xl shadow-2xl mt-4 text-center">
             <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1">POCZEKALNIA POKOJU</h3>
-            <div class="flex items-center justify-center space-x-2 mb-4">
+            <div class="flex items-center justify-center space-x-2 mb-3">
                 <span id="room-code-val" class="text-3xl font-black font-mono text-amber-400 tracking-wider">------</span>
                 <button onclick="copyRoomCode()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 p-2 rounded-lg text-xs" title="Kopiuj Kod">
                     <i class="fa-solid fa-copy"></i>
                 </button>
             </div>
 
-            <p class="text-xs text-slate-400 mb-4">Udostępnij kod znajomemu lub dodaj boty komputerowe do rozgrywki!</p>
+            <div class="mb-4 flex gap-2">
+                <button onclick="copyRoomLink()" class="w-full bg-indigo-600/80 hover:bg-indigo-600 text-white font-semibold py-1.5 px-3 rounded-lg text-xs transition flex items-center justify-center space-x-1.5 border border-indigo-400/30">
+                    <i class="fa-solid fa-link"></i>
+                    <span>KOPIUJ LINK DLA ZNAJOMYCH</span>
+                </button>
+            </div>
+
+            <p class="text-xs text-slate-400 mb-4">Wyślij link znajomym. Gdy dołączą, natychmiast pojawią się na liście!</p>
 
             <div id="lobby-players-list" class="space-y-2 mb-6">
                 <!-- Players in lobby populated here -->
@@ -196,7 +203,7 @@
                 </button>
             </div>
 
-            <button id="btn-start-room" onclick="launchRoomGame(true)" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold py-3 rounded-xl shadow-lg transition text-sm">
+            <button id="btn-start-room" onclick="launchRoomGame(true)" class="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-extrabold py-3 rounded-xl shadow-lg transition text-sm">
                 <i class="fa-solid fa-play mr-2"></i> ROZPOCZNIJ GRĘ
             </button>
         </div>
@@ -403,11 +410,10 @@
 
         let selectedColor = '#ef4444';
         let currentRoomCode = '';
-        let myPeerId = '';
-        let peer = null;
-        let connections = [];
-        let hostConn = null;
+        let myClientId = 'user_' + Math.random().toString(36).substr(2, 9);
+        let mqttClient = null;
         let isHost = false;
+        let heartbeatInterval = null;
 
         let gameState = {
             players: [],
@@ -423,7 +429,17 @@
 
         window.addEventListener('DOMContentLoaded', () => {
             renderBoardSkeleton();
+            checkUrlRoomCode();
         });
+
+        function checkUrlRoomCode() {
+            const params = new URLSearchParams(window.location.search);
+            const room = params.get('room');
+            if (room) {
+                const joinInput = document.getElementById('join-room-code');
+                if (joinInput) joinInput.value = room.toUpperCase();
+            }
+        }
 
         function selectColor(color) {
             selectedColor = color;
@@ -437,19 +453,51 @@
             });
         }
 
-        // --- NETWORK / PEERJS REALTIME MULTIPLAYER ---
-        function initPeer(customId = null) {
+        // --- ULTRA-RELIABLE MQTT WEBSOCKET MULTIPLAYER ---
+        function connectMqttBroker() {
             return new Promise((resolve, reject) => {
-                peer = customId ? new Peer(customId) : new Peer();
-                peer.on('open', (id) => {
-                    myPeerId = id;
-                    resolve(id);
-                });
-                peer.on('error', (err) => {
-                    console.error("Peer error:", err);
-                    alert("Błąd połączenia sieciowego: " + err.type);
-                    reject(err);
-                });
+                if (mqttClient && mqttClient.connected) {
+                    resolve(mqttClient);
+                    return;
+                }
+
+                // Primary & Fallback Brokers
+                const brokers = [
+                    'wss://broker.emqx.io:8084/mqtt',
+                    'wss://test.mosquitto.org:8081'
+                ];
+
+                let currentBrokerIdx = 0;
+
+                function tryConnect() {
+                    const brokerUrl = brokers[currentBrokerIdx];
+                    console.log("Łączenie z brokerem WebSocket:", brokerUrl);
+
+                    mqttClient = mqtt.connect(brokerUrl, {
+                        clientId: myClientId,
+                        clean: true,
+                        connectTimeout: 4000,
+                        keepalive: 10
+                    });
+
+                    mqttClient.on('connect', () => {
+                        console.log("Połączono z serwerem online WebSocket!");
+                        resolve(mqttClient);
+                    });
+
+                    mqttClient.on('error', (err) => {
+                        console.error("Błąd połączenia z brokerem:", err);
+                        mqttClient.end();
+                        currentBrokerIdx++;
+                        if (currentBrokerIdx < brokers.length) {
+                            tryConnect();
+                        } else {
+                            reject(new Error("Nie można połączyć z serwerem online"));
+                        }
+                    });
+                }
+
+                tryConnect();
             });
         }
 
@@ -458,34 +506,36 @@
             const randomCode = 'RUDA-' + Math.floor(1000 + Math.random() * 9000);
             
             try {
-                await initPeer(randomCode);
+                await connectMqttBroker();
                 isHost = true;
                 currentRoomCode = randomCode;
                 gameState.isOnline = true;
 
                 gameState.players = [{
-                    id: myPeerId,
+                    id: myClientId,
                     name: name,
                     color: selectedColor,
                     money: 1500,
                     position: 0,
-                    isBot: false
+                    isBot: false,
+                    lastSeen: Date.now()
                 }];
 
-                peer.on('connection', (conn) => {
-                    connections.push(conn);
-                    conn.on('data', (data) => handleNetworkData(data, conn));
-                    conn.on('close', () => {
-                        gameState.players = gameState.players.filter(p => p.id !== conn.peer);
-                        broadcastState();
-                        renderLobbyPlayers();
-                    });
+                const topic = `monopoly-ruda/room/${currentRoomCode}`;
+                mqttClient.subscribe(topic, { qos: 1 });
+
+                mqttClient.on('message', (top, message) => {
+                    try {
+                        const payload = JSON.parse(message.toString());
+                        handleNetworkMessage(payload);
+                    } catch(e) { console.error("Bad message", e); }
                 });
 
+                startHeartbeat();
                 setupRoomLobbyUI(currentRoomCode);
+                broadcastState();
             } catch (e) {
-                console.warn("KOD zajęty, próba ponowna...", e);
-                createNewOnlineGame();
+                alert("Błąd tworzenia pokoju online. Sprawdź połączenie z internetem!");
             }
         }
 
@@ -496,27 +546,36 @@
             const name = document.getElementById('player-name-input').value.trim() || 'Gracz';
 
             try {
-                await initPeer();
+                await connectMqttBroker();
                 isHost = false;
                 currentRoomCode = code;
                 gameState.isOnline = true;
 
-                hostConn = peer.connect(code);
-                hostConn.on('open', () => {
-                    hostConn.send({
-                        type: 'JOIN_LOBBY',
-                        player: {
-                            id: myPeerId,
-                            name: name,
-                            color: selectedColor,
-                            money: 1500,
-                            position: 0,
-                            isBot: false
-                        }
-                    });
+                const topic = `monopoly-ruda/room/${currentRoomCode}`;
+                mqttClient.subscribe(topic, { qos: 1 });
+
+                mqttClient.on('message', (top, message) => {
+                    try {
+                        const payload = JSON.parse(message.toString());
+                        handleNetworkMessage(payload);
+                    } catch(e) { console.error("Bad message", e); }
                 });
 
-                hostConn.on('data', (data) => handleNetworkData(data));
+                // Send JOIN_ROOM signal to host
+                publishNetworkMessage({
+                    type: 'JOIN_ROOM',
+                    player: {
+                        id: myClientId,
+                        name: name,
+                        color: selectedColor,
+                        money: 1500,
+                        position: 0,
+                        isBot: false,
+                        lastSeen: Date.now()
+                    }
+                });
+
+                startHeartbeat();
                 setupRoomLobbyUI(currentRoomCode);
 
                 // Disable host controls for client
@@ -528,24 +587,37 @@
             }
         }
 
-        function handleNetworkData(data, conn = null) {
-            if (data.type === 'JOIN_LOBBY' && isHost) {
-                if (gameState.players.length >= 4) {
-                    conn.send({ type: 'ERROR', msg: 'Pokój jest pełny!' });
-                    return;
+        function publishNetworkMessage(payload) {
+            if (mqttClient && mqttClient.connected && currentRoomCode) {
+                const topic = `monopoly-ruda/room/${currentRoomCode}`;
+                mqttClient.publish(topic, JSON.stringify(payload), { qos: 1 });
+            }
+        }
+
+        function handleNetworkMessage(data) {
+            // Ignore messages sent by self
+            if (data.senderId === myClientId) return;
+
+            if (data.type === 'JOIN_ROOM' && isHost) {
+                const existingIdx = gameState.players.findIndex(p => p.id === data.player.id);
+                if (existingIdx !== -1) {
+                    gameState.players[existingIdx] = data.player;
+                } else if (gameState.players.length < 4) {
+                    gameState.players.push(data.player);
                 }
-                gameState.players.push(data.player);
                 broadcastState();
                 renderLobbyPlayers();
-            } else if (data.type === 'SYNC_STATE') {
+            } else if (data.type === 'ROOM_STATE') {
                 gameState = data.state;
                 if (gameState.gameStarted && document.getElementById('game-screen').classList.contains('hidden')) {
                     launchRoomGame(false);
                 }
                 renderLobbyPlayers();
                 renderGameState();
+            } else if (data.type === 'HEARTBEAT' && isHost) {
+                const p = gameState.players.find(x => x.id === data.senderId);
+                if (p) p.lastSeen = Date.now();
             } else if (data.type === 'ACTION' && isHost) {
-                // Execute action on host and sync
                 if (data.action === 'ROLL') rollDiceAction();
                 else if (data.action === 'END_TURN') endTurnAction();
                 else if (data.action === 'BUY') buyProperty(BOARD_TILES[data.tileId]);
@@ -556,11 +628,32 @@
             }
         }
 
+        function startHeartbeat() {
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            heartbeatInterval = setInterval(() => {
+                publishNetworkMessage({ type: 'HEARTBEAT', senderId: myClientId });
+
+                // Host checks inactive players
+                if (isHost && !gameState.gameStarted) {
+                    const now = Date.now();
+                    const initialCount = gameState.players.length;
+                    gameState.players = gameState.players.filter(p => p.isBot || p.id === myClientId || (now - (p.lastSeen || now)) < 10000);
+                    if (gameState.players.length !== initialCount) {
+                        broadcastState();
+                        renderLobbyPlayers();
+                    }
+                }
+            }, 2500);
+        }
+
         function broadcastState() {
             if (!isHost) return;
-            connections.forEach(c => {
-                if (c.open) c.send({ type: 'SYNC_STATE', state: gameState });
+            publishNetworkMessage({
+                type: 'ROOM_STATE',
+                senderId: myClientId,
+                state: gameState
             });
+            renderLobbyPlayers();
             renderGameState();
         }
 
@@ -573,8 +666,13 @@
                 else if (action === 'TRADE_OFFER') handleIncomingTradeAction(payload.trade);
                 else if (action === 'TRADE_ACCEPT') acceptTrade();
                 else if (action === 'TRADE_REJECT') rejectTrade();
-            } else if (hostConn && hostConn.open) {
-                hostConn.send({ type: 'ACTION', action, ...payload });
+            } else {
+                publishNetworkMessage({
+                    type: 'ACTION',
+                    senderId: myClientId,
+                    action: action,
+                    ...payload
+                });
             }
         }
 
@@ -593,17 +691,24 @@
             const list = document.getElementById('lobby-players-list');
             if (!list) return;
             list.innerHTML = '';
+            
             gameState.players.forEach(p => {
                 list.innerHTML += `
                     <div class="bg-slate-950 border border-slate-800 p-2.5 rounded-xl flex justify-between items-center text-xs">
                         <div class="flex items-center space-x-2">
-                            <div class="w-3 h-3 rounded-full" style="background-color: ${p.color}"></div>
-                            <span class="font-bold text-slate-200">${p.name} ${p.isBot ? '(Bot)' : ''} ${p.id === myPeerId ? '(Ty)' : ''}</span>
+                            <div class="w-3.5 h-3.5 rounded-full border border-white/40" style="background-color: ${p.color}"></div>
+                            <span class="font-bold text-slate-200">${p.name} ${p.isBot ? '(Bot)' : ''} ${p.id === myClientId ? '(Ty)' : ''}</span>
                         </div>
-                        <span class="text-[10px] bg-slate-800 px-2 py-0.5 rounded text-emerald-400 font-mono font-bold">Połączono</span>
+                        <span class="text-[10px] bg-emerald-950/80 border border-emerald-500/30 px-2 py-0.5 rounded text-emerald-400 font-mono font-bold">W POKOJU</span>
                     </div>
                 `;
             });
+
+            // Update Start Game Button
+            const startBtn = document.getElementById('btn-start-room');
+            if (startBtn && isHost) {
+                startBtn.disabled = gameState.players.length < 2;
+            }
         }
 
         function addBotToRoom() {
@@ -613,12 +718,13 @@
             const idx = gameState.players.length;
 
             gameState.players.push({
-                id: `bot-${idx}`,
+                id: `bot-${idx}-${Date.now()}`,
                 name: botNames[idx - 1] || `Bot ${idx}`,
                 color: botColors[idx - 1] || '#38bdf8',
                 money: 1500,
                 position: 0,
-                isBot: true
+                isBot: true,
+                lastSeen: Date.now()
             });
 
             broadcastState();
@@ -642,7 +748,18 @@
             dummy.select();
             document.execCommand("copy");
             document.body.removeChild(dummy);
-            alert(`Skopiowano kod pokoju online: ${currentRoomCode}`);
+            alert(`Skopiowano kod pokoju: ${currentRoomCode}`);
+        }
+
+        function copyRoomLink() {
+            const url = window.location.origin + window.location.pathname + '?room=' + currentRoomCode;
+            const dummy = document.createElement("input");
+            document.body.appendChild(dummy);
+            dummy.value = url;
+            dummy.select();
+            document.execCommand("copy");
+            document.body.removeChild(dummy);
+            alert(`Skopiowano link do pokoju online!\n${url}`);
         }
 
         function launchRoomGame(shouldBroadcast = true) {
@@ -651,7 +768,7 @@
             document.getElementById('game-screen').classList.remove('hidden');
 
             if (isHost && shouldBroadcast) {
-                gameState.logs = [`[Pokój ${currentRoomCode}] Rozpoczęto grę online! Tura gracza: ${gameState.players[0].name}.`];
+                gameState.logs = [`[Pokój ${currentRoomCode}] Gra online rozpoczęta! Tura gracza: ${gameState.players[0].name}.`];
                 broadcastState();
             }
 
@@ -661,10 +778,10 @@
         // QUICK LOCAL / BOT GAME
         function startQuickGame(botCount) {
             const name = document.getElementById('player-name-input').value.trim() || 'Karlik';
-            myPeerId = 'local-player-0';
+            myClientId = 'local-player-0';
             
             gameState.players = [{
-                id: myPeerId,
+                id: myClientId,
                 name: name,
                 color: selectedColor,
                 money: 1500,
@@ -770,7 +887,7 @@
                     pEl.innerHTML = `
                         <div class="flex items-center space-x-2">
                             <div class="w-3 h-3 rounded-full" style="background-color: ${p.color}"></div>
-                            <span class="text-xs font-bold ${isTurn ? 'text-amber-300' : 'text-slate-200'}">${p.name} ${p.isBot ? '(Bot)' : ''} ${p.id === myPeerId ? '(Ty)' : ''}</span>
+                            <span class="text-xs font-bold ${isTurn ? 'text-amber-300' : 'text-slate-200'}">${p.name} ${p.isBot ? '(Bot)' : ''} ${p.id === myClientId ? '(Ty)' : ''}</span>
                         </div>
                         <span class="font-mono text-xs font-bold text-emerald-400">${p.money} PLN</span>
                     `;
@@ -802,7 +919,7 @@
             });
 
             const curPlayer = gameState.players[gameState.turnIndex];
-            const isMyTurn = curPlayer && curPlayer.id === myPeerId;
+            const isMyTurn = curPlayer && curPlayer.id === myClientId;
 
             document.getElementById('current-player-name').innerText = curPlayer ? curPlayer.name : '-';
             document.getElementById('current-player-name').style.color = curPlayer ? curPlayer.color : '#f8fafc';
@@ -819,7 +936,7 @@
             }
 
             // Check incoming trade proposals
-            if (gameState.tradeProposal && gameState.tradeProposal.targetId === myPeerId) {
+            if (gameState.tradeProposal && gameState.tradeProposal.targetId === myClientId) {
                 showIncomingModal(gameState.tradeProposal);
             }
 
@@ -942,7 +1059,7 @@
             const curPlayer = gameState.players[gameState.turnIndex];
             const propState = gameState.properties[tile.id];
 
-            const isMyTurn = curPlayer && curPlayer.id === myPeerId;
+            const isMyTurn = curPlayer && curPlayer.id === myClientId;
 
             // BUY BUTTON
             if (tile.price && !propState && curPlayer.position === tile.id && gameState.hasRolled && isMyTurn) {
